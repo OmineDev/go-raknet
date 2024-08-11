@@ -80,6 +80,10 @@ type Conn struct {
 	lastActivity atomic.Value[time.Time]
 }
 
+func (conn *Conn) WaitClosed() chan struct{} {
+	return conn.closed
+}
+
 // newConn constructs a new connection specifically dedicated to the address passed.
 func newConn(conn net.PacketConn, addr net.Addr, mtuSize uint16) *Conn {
 	return newConnWithLimits(conn, addr, mtuSize, true)

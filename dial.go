@@ -249,7 +249,10 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 		return nil, wrap(ctx, err)
 	}
 
-	go clientListen(conn, udpConn, dialer.ErrorLog)
+	go func() {
+		clientListen(conn, udpConn, dialer.ErrorLog)
+		conn.closeImmediately()
+	}()
 	select {
 	case <-conn.connected:
 		_ = packetConn.SetDeadline(time.Time{})
@@ -280,6 +283,7 @@ func clientListen(rakConn *Conn, conn net.Conn, errorLog *log.Logger) {
 	b := make([]byte, 1500)
 	buf := bytes.NewBuffer(b[:0])
 	for {
+		conn.SetReadDeadline(time.Now().Add(time.Second * 5))
 		n, err := conn.Read(b)
 		if err != nil {
 			if ErrConnectionClosed(err) {
