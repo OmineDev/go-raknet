@@ -4,16 +4,17 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/df-mc/atomic"
-	"github.com/sandertv/go-raknet/internal/message"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/df-mc/atomic"
+	"github.com/sandertv/go-raknet/internal/message"
 )
 
 const (
 	// currentProtocol is the current RakNet protocol version. This is Minecraft specific.
-	currentProtocol byte = 11
+	currentProtocol byte = 8
 
 	maxMTUSize    = 1400
 	maxWindowSize = 2048
