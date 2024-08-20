@@ -133,7 +133,7 @@ func (conn *Conn) startTicking() {
 		case t := <-ticker.C:
 			i++
 			conn.flushACKs()
-			if i%2 == 0 {
+			if i%50 == 0 { // Change to 5 seconds per ping
 				// We send a connected ping to calculate the rtt and let the other side know we haven't
 				// timed out.
 				conn.sendPing()
