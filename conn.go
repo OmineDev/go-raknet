@@ -5,8 +5,6 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
-	"github.com/sandertv/go-raknet/internal"
-	"github.com/sandertv/go-raknet/internal/message"
 	"io"
 	"net"
 	"net/netip"
@@ -14,12 +12,16 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sandertv/go-raknet/internal"
+	"github.com/sandertv/go-raknet/internal/message"
 )
 
 const (
 	// protocolVersion is the current RakNet protocol version. This is Minecraft
 	// specific.
-	protocolVersion byte = 11
+	// Netease: 11 -> 8
+	protocolVersion byte = 8
 
 	minMTUSize    = 576
 	maxMTUSize    = 1492
@@ -89,6 +91,10 @@ type Conn struct {
 	lastActivity atomic.Pointer[time.Time]
 }
 
+func (conn *Conn) WaitClosed() chan struct{} {
+	return conn.closed
+}
+
 // newConn constructs a new connection specifically dedicated to the address
 // passed.
 func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandler) *Conn {
@@ -156,7 +162,8 @@ func (conn *Conn) startTicking() {
 				}
 				continue
 			}
-			if i%5 == 0 {
+			// Netease: change to 5 seconds per ping
+			if i%50 == 0 {
 				// Ping the other end periodically to prevent timeouts.
 				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
 

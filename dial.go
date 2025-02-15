@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/sandertv/go-raknet/internal"
 	"log/slog"
 	"math/rand/v2"
 	"net"
 	"sync/atomic"
 	"time"
+
+	"github.com/sandertv/go-raknet/internal"
 
 	"github.com/sandertv/go-raknet/internal/message"
 )
@@ -239,7 +240,10 @@ func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, erro
 		return nil, dialer.error("dial", fmt.Errorf("send connection request: %w", err))
 	}
 
-	go dialer.clientListen(conn, state.conn)
+	go func() {
+		dialer.clientListen(conn, state.conn)
+		conn.closeImmediately()
+	}()
 
 	select {
 	case <-conn.connected:
@@ -259,6 +263,7 @@ func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 	// allowed to have. We can re-use this buffer for each packet.
 	b := make([]byte, rakConn.effectiveMTU())
 	for {
+		conn.SetReadDeadline(time.Now().Add(time.Second * 5))
 		n, err := conn.Read(b)
 		if err == nil && n != 0 {
 			err = rakConn.receive(b[:n])
