@@ -280,7 +280,6 @@ func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 	// allowed to have. We can re-use this buffer for each packet.
 	b := make([]byte, rakConn.effectiveMTU())
 	for {
-		conn.SetReadDeadline(time.Now().Add(time.Second * 5))
 		n, err := conn.Read(b)
 		if err == nil && n != 0 {
 			err = rakConn.receive(b[:n])

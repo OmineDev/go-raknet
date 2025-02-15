@@ -166,17 +166,19 @@ func (conn *Conn) startTicking() {
 				}
 				continue
 			}
+			if i%5 == 0 {
+				conn.mu.Lock()
+				if t.Sub(*conn.lastActivity.Load()) > time.Second*5 {
+					// No activity for too long: Start timeout.
+					_ = conn.Close()
+				}
+				conn.mu.Unlock()
+			}
 			// Netease: change to 5 seconds per ping
 			if i%50 == 0 {
 				// Ping the other end periodically to prevent timeouts.
 				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
 
-				conn.mu.Lock()
-				if t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt(t)*2 {
-					// No activity for too long: Start timeout.
-					_ = conn.Close()
-				}
-				conn.mu.Unlock()
 			}
 		case <-conn.ctx.Done():
 			return
