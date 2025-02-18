@@ -89,6 +89,10 @@ type Conn struct {
 	retransmission *resendMap
 
 	lastActivity atomic.Pointer[time.Time]
+
+	encodingBuf *bytes.Buffer
+
+	bytesPool *sync.Pool
 }
 
 func (conn *Conn) WaitClosed() chan struct{} {
@@ -115,6 +119,11 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		buf:            bytes.NewBuffer(make([]byte, 0, mtu-28)), // - headers.
 		ackBuf:         bytes.NewBuffer(make([]byte, 0, 128)),
 		nackBuf:        bytes.NewBuffer(make([]byte, 0, 64)),
+		encodingBuf:    bytes.NewBuffer(make([]byte, 0, mtu-28-packetAdditionalSize)),
+		bytesPool: &sync.Pool{New: func() any {
+			buf := make([]byte, mtu-28)
+			return &buf
+		}},
 	}
 	t := time.Now()
 	c.lastActivity.Store(&t)
@@ -133,7 +142,7 @@ func (conn *Conn) effectiveMTU() uint16 {
 // out.
 func (conn *Conn) startTicking() {
 	var (
-		interval = time.Second / 10
+		interval = time.Second / 100
 		ticker   = time.NewTicker(interval)
 		i        int64
 		acksLeft int
@@ -143,26 +152,31 @@ func (conn *Conn) startTicking() {
 		select {
 		case t := <-ticker.C:
 			i++
-			conn.flushACKs()
-			if i%3 == 0 {
+			if err := conn.sendDatagramImmediately(); err != nil {
+				conn.closeImmediately()
+			}
+			if i%10 == 0 {
+				conn.flushACKs()
+				if unix := conn.closing.Load(); unix != 0 {
+					before := acksLeft
+					conn.mu.Lock()
+					acksLeft = len(conn.retransmission.unacknowledged)
+					conn.mu.Unlock()
+
+					if before != 0 && acksLeft == 0 {
+						conn.closeImmediately()
+					}
+					since := t.Sub(time.Unix(unix, 0))
+					if (acksLeft == 0 && since > time.Second) || since > time.Second*5 {
+						conn.closeImmediately()
+					}
+					continue
+				}
+			}
+			if i%30 == 0 {
 				conn.checkResend(t)
 			}
-			if unix := conn.closing.Load(); unix != 0 {
-				before := acksLeft
-				conn.mu.Lock()
-				acksLeft = len(conn.retransmission.unacknowledged)
-				conn.mu.Unlock()
-
-				if before != 0 && acksLeft == 0 {
-					conn.closeImmediately()
-				}
-				since := t.Sub(time.Unix(unix, 0))
-				if (acksLeft == 0 && since > time.Second) || since > time.Second*5 {
-					conn.closeImmediately()
-				}
-				continue
-			}
-			if i%5 == 0 {
+			if i%50 == 0 {
 				conn.mu.Lock()
 				if t.Sub(*conn.lastActivity.Load()) > time.Second*5 {
 					// No activity for too long: Start timeout.
@@ -171,10 +185,9 @@ func (conn *Conn) startTicking() {
 				conn.mu.Unlock()
 			}
 			// Netease: change to 5 seconds per ping
-			if i%50 == 0 {
+			if i%500 == 0 {
 				// Ping the other end periodically to prevent timeouts.
 				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
-
 			}
 		case <-conn.closed:
 			return
@@ -270,7 +283,19 @@ func (conn *Conn) write(b []byte) (n int, err error) {
 			pk.splitIndex = uint32(splitIndex)
 			pk.splitID = splitID
 		}
-		if err = conn.sendDatagram(pk); err != nil {
+
+		pk.write(conn.encodingBuf)
+		packetPool.Put(pk)
+
+		data := *(conn.bytesPool.Get().(*[]byte))
+		if cap(data) < conn.encodingBuf.Len() {
+			data = make([]byte, conn.encodingBuf.Len())
+		}
+		data = data[:conn.encodingBuf.Len()]
+		copy(data, conn.encodingBuf.Bytes())
+		conn.encodingBuf.Reset()
+
+		if err = conn.appendDatagram(data); err != nil {
 			return 0, err
 		}
 		n += len(content)
@@ -321,10 +346,9 @@ func (conn *Conn) closeImmediately() {
 
 		conn.mu.Lock()
 		defer conn.mu.Unlock()
-		// Make sure to return all unacknowledged packets to the packet pool.
+		// Make sure to clear all data in the retransmission queue.
 		for _, record := range conn.retransmission.unacknowledged {
-			record.pk.content = record.pk.content[:0]
-			packetPool.Put(record.pk)
+			record.data = record.data[:0]
 		}
 		clear(conn.retransmission.unacknowledged)
 	})
@@ -580,11 +604,8 @@ func (conn *Conn) handleACK(b []byte) error {
 	}
 	for _, sequenceNumber := range ack.packets {
 		// Take out all stored packets from the recovery queue.
-		if p, ok := conn.retransmission.acknowledge(sequenceNumber); ok {
-			// Clear the packet and return it to the pool so that it may be
-			// re-used.
-			p.content = p.content[:0]
-			packetPool.Put(p)
+		if data, ok := conn.retransmission.acknowledge(sequenceNumber); ok {
+			conn.bytesPool.Put(&data)
 		}
 	}
 	return nil
@@ -607,34 +628,68 @@ func (conn *Conn) handleNACK(b []byte) error {
 // numbers passed.
 func (conn *Conn) resend(sequenceNumbers []uint24) (err error) {
 	for _, sequenceNumber := range sequenceNumbers {
-		pk, ok := conn.retransmission.retransmit(sequenceNumber)
+		data, ok := conn.retransmission.retransmit(sequenceNumber)
 		if !ok {
 			continue
 		}
-		if err = conn.sendDatagram(pk); err != nil {
+		if err = conn.appendDatagram(data); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func (conn *Conn) appendDatagram(data []byte) error {
+	// add header
+	if conn.buf.Len() == 0 {
+		conn.buf.WriteByte(bitFlagDatagram | bitFlagNeedsBAndAS)
+		writeUint24(conn.buf, conn.seq)
+	}
+	// handle by length
+	totalLen := conn.buf.Len() + len(data)
+	mtu := int(conn.effectiveMTU())
+	if totalLen > mtu {
+		if err := conn.sendDatagram(); err != nil {
+			return err
+		}
+	}
+	conn.buf.Write(data)
+	conn.bytesPool.Put(&data)
+	if totalLen == mtu {
+		return conn.sendDatagram()
+	}
+	return nil
+}
+
 // sendDatagram sends a datagram over the connection that includes the packet
 // passed. It is assigned a new sequence number and added to the retransmission.
-func (conn *Conn) sendDatagram(pk *packet) error {
-	conn.buf.WriteByte(bitFlagDatagram | bitFlagNeedsBAndAS)
-	seq := conn.seq.Inc()
-	writeUint24(conn.buf, seq)
-	pk.write(conn.buf)
-	defer conn.buf.Reset()
+func (conn *Conn) sendDatagram() error {
+	data := *(conn.bytesPool.Get().(*[]byte))
+	if cap(data) < conn.buf.Len() {
+		data = make([]byte, conn.buf.Len())
+	}
+	data = data[:conn.buf.Len()]
+	copy(data, conn.buf.Bytes())
+	conn.buf.Reset()
 
 	// We then re-add the pk to the recovery queue in case the new one gets
 	// lost too, in which case we need to resend it again.
-	conn.retransmission.add(seq, pk)
+	conn.retransmission.add(conn.seq.Inc(), data)
 
-	if err := conn.writeTo(conn.buf.Bytes(), conn.raddr); err != nil {
+	if err := conn.writeTo(data, conn.raddr); err != nil {
 		return fmt.Errorf("send datagram: %w", err)
 	}
 	return nil
+}
+
+func (conn *Conn) sendDatagramImmediately() error {
+	if conn.buf.Len() == 0 {
+		return nil
+	}
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	return conn.sendDatagram()
 }
 
 // writeTo calls WriteTo on the underlying UDP connection and returns an error
