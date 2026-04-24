@@ -96,7 +96,7 @@ type Conn struct {
 }
 
 func (conn *Conn) WaitClosed() chan struct{} {
-	return conn.closed
+	return conn.connected
 }
 
 // newConn constructs a new connection specifically dedicated to the address
